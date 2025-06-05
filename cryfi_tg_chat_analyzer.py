@@ -318,6 +318,6 @@ if st.button("Process Group Chat", type="primary"):
                     "date": str(msg.date),
                     "sender_name": msg.sender.first_name if msg.sender else "Unknown",
                     "message": msg.message,
-                })updatin
+                })
 
 #streamlit run cryfi_tg_chat_analyzer.py
