@@ -2,7 +2,7 @@ import sys
 print("Python executable:", sys.executable)
 # The rest of your code starts here, e.g., from telethon.sync import TelegramClient
 import streamlit as st
-from telethon.sync import TelegramClient
+from telethon import TelegramClient # Removed .sync as we're handling async explicitly
 from telethon.tl.types import MessageMediaPoll
 from datetime import datetime, timedelta
 import asyncio
@@ -23,7 +23,8 @@ except KeyError:
     st.info("Please add TELEGRAM_API_ID and TELEGRAM_API_HASH to your .streamlit/secrets.toml file.")
     st.stop()
 
-# Session name for Telethon client
+# Session name for Telethon client. This will correspond to a file like 'telegram_summarizer_session.session'
+# You need to ensure this file is generated locally and then pushed to your GitHub repo.
 session_name = 'telegram_summarizer_session'
 
 # --- Gemini API Configuration ---
@@ -50,24 +51,15 @@ async def call_gemini_api(prompt, schema=None):
     api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
     try:
-        # Streamlit doesn't directly support async fetch in its main thread,
-        # but for demonstration, we'll use a simple approach.
-        # In a real deployed app, you might need a separate thread/process for async calls.
-        # For now, we'll simulate a synchronous call using asyncio.run in a function.
-        # This part requires a bit of a workaround if running directly in Streamlit's sync context.
-        # However, the environment where this code runs (Canvas) handles async fetch correctly.
-        response = await asyncio.to_thread(
-            lambda: st.runtime.scriptrunner.add_script_run_ctx(
-                __import__('requests').post
-            )(
-                api_url,
-                headers={'Content-Type': 'application/json'},
-                data=json.dumps(payload)
-            )
-        )
-        result = response.json()
+        # Use aiohttp for async HTTP requests for better compatibility in async contexts
+        # You'll need to add aiohttp to your requirements.txt
+        # pip install aiohttp
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.post(api_url, headers={'Content-Type': 'application/json'}, json=payload) as response:
+                result = await response.json()
 
-        if response.status_code != 200:
+        if response.status != 200:
             st.error(f"Gemini API Error: {result.get('error', {}).get('message', 'Unknown error')}")
             return None
 
@@ -91,9 +83,35 @@ async def call_gemini_api(prompt, schema=None):
 # --- Function to get Telegram client ---
 @st.cache_resource
 def get_telegram_client(api_id, api_hash, session_name):
-    """Initializes and connects the Telegram client."""
-    client = TelegramClient(session_name, api_id, api_hash)
-    return client
+    """Initializes, connects, and ensures authorization of the Telegram client."""
+
+    async def _init_and_connect():
+        # Telethon client initialization is safe here
+        client = TelegramClient(session_name, api_id, api_hash)
+        
+        # Connect to Telegram
+        await client.connect()
+
+        # Check if authorized and handle session.
+        # For Streamlit Cloud, you MUST pre-generate the session file locally
+        # and upload it to your GitHub repo. Interactive login is not feasible.
+        if not await client.is_user_authorized():
+            st.error("Telegram client is not authorized. "
+                     "Please ensure your session file (.session) was generated locally (by running client.start() once) "
+                     "and then pushed to your GitHub repository.")
+            st.stop() # Stop the app if authorization fails
+        
+        return client
+
+    try:
+        # Run the async initialization and connection in a dedicated event loop
+        # This is where the core fix for the RuntimeError is.
+        return asyncio.run(_init_and_connect())
+    except Exception as e:
+        st.error(f"Failed to initialize or connect to Telegram client. Error: {e}")
+        st.info("Make sure your API ID/Hash are correct and your .session file is valid and present in the repo.")
+        st.stop()
+
 
 # --- Function to fetch messages ---
 async def fetch_telegram_messages(client, group_entity, start_date, end_date):
@@ -108,6 +126,7 @@ async def fetch_telegram_messages(client, group_entity, start_date, end_date):
 
     try:
         # Iterate through messages, filtering by date
+        # Adjusted offset_date and reverse for efficiency with date range
         async for message in client.iter_messages(group_entity, offset_date=end_date + timedelta(days=1), reverse=True):
             if message.date < start_date:
                 break # Stop if messages are older than the start date
@@ -135,20 +154,10 @@ with a focus on quizzes and potential scam activities.
 """)
 
 # --- Telegram Client Initialization and Connection ---
+# This call is wrapped by st.cache_resource, so it runs only once per session
+# and handles the async initialization internally.
 client = get_telegram_client(api_id, api_hash, session_name)
-
-# Check if client is connected, if not, try to connect
-if not client.is_connected():
-    try:
-        with st.spinner("Connecting to Telegram..."):
-            # Use a separate thread for client.start() to avoid blocking Streamlit's main thread
-            # This is a common pattern for integrating async libraries into Streamlit
-            # In the Canvas environment, `asyncio.run` works within the context.
-            asyncio.run(client.start())
-            st.success("Connected to Telegram!")
-    except Exception as e:
-        st.error(f"Failed to connect to Telegram. Please check your API ID/Hash or try again. Error: {e}")
-        st.stop() # Stop the app if connection fails
+st.success("Telegram Client initialized and connected!") # Indicate success after get_telegram_client finishes
 
 # --- User Inputs ---
 st.header("1. Enter Group Details and Timeframe")
@@ -178,6 +187,8 @@ if st.button("Process Group Chat", type="primary"):
     group_entity = None
     with st.spinner(f"Resolving group '{group_input}'..."):
         try:
+            # All calls to telethon methods must be awaited, and wrapped in asyncio.run()
+            # if called from synchronous Streamlit code.
             group_entity = asyncio.run(client.get_entity(group_input))
             st.success(f"Found group: **{group_entity.title}**")
         except Exception as e:
@@ -186,7 +197,10 @@ if st.button("Process Group Chat", type="primary"):
 
     if group_entity:
         with st.spinner("Fetching messages... This might take a while for large groups."):
-            messages = asyncio.run(fetch_telegram_messages(client, group_entity, datetime.combine(start_date, datetime.min.time()), datetime.combine(end_date, datetime.max.time())))
+            # Convert dates to datetime objects for comparison with message.date
+            start_datetime = datetime.combine(start_date, datetime.min.time())
+            end_datetime = datetime.combine(end_date, datetime.max.time())
+            messages = asyncio.run(fetch_telegram_messages(client, group_entity, start_datetime, end_datetime))
 
         st.success(f"Successfully fetched {len(messages)} messages.")
 
@@ -304,6 +318,6 @@ if st.button("Process Group Chat", type="primary"):
                     "date": str(msg.date),
                     "sender_name": msg.sender.first_name if msg.sender else "Unknown",
                     "message": msg.message,
-                })
+                })updatin
 
 #streamlit run cryfi_tg_chat_analyzer.py
